@@ -5,7 +5,7 @@ use eframe::egui;
 
 use crate::icc;
 use crate::kscreen::{self, ColorState, Output};
-use crate::profiles::{self, Profiles, Settings};
+use crate::profiles::{self, Profiles, Settings, Tab};
 
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -33,6 +33,14 @@ pub struct App {
     job: Option<(Job, JoinHandle<anyhow::Result<Vec<Output>>>)>,
     status: String,
     fitted: bool,
+    /// Curve point index and value under the pointer last frame, to fill gaps in fast strokes.
+    last_draw: Option<(usize, f32)>,
+    // Sizes measured last frame. egui lays out in one pass, so growing a widget
+    // to fill the window needs to know how much space its neighbours take.
+    tabs_width: f32,
+    slider_extra: f32,
+    profile_extra: f32,
+    bottom_height: f32,
 }
 
 impl App {
@@ -52,6 +60,11 @@ impl App {
             job: None,
             status,
             fitted: false,
+            last_draw: None,
+            tabs_width: 0.0,
+            slider_extra: 0.0,
+            profile_extra: 0.0,
+            bottom_height: 0.0,
         }
     }
 
@@ -64,18 +77,18 @@ impl App {
             .into_iter()
             .find(|p| *p != output.color.icc_path)
             .unwrap();
-        let settings = self.settings;
+        let curve = self.settings.curve.clone();
         let name = output.name.clone();
         let handle = std::thread::spawn(move || {
             std::fs::create_dir_all(&dir)?;
-            icc::write_profile(path.as_ref(), &settings)?;
+            icc::write_profile(path.as_ref(), &curve)?;
             kscreen::set_color(&name, &ColorState { source: "ICC".into(), icc_path: path })?;
             kscreen::list_outputs()
         });
         self.pending = Some(Pending {
             output: output.name,
             previous: output.color,
-            previous_settings: self.applied,
+            previous_settings: self.applied.clone(),
             deadline: Instant::now() + CONFIRM_TIMEOUT,
             focused: false,
         });
@@ -138,17 +151,90 @@ impl eframe::App for App {
         let content_size = egui::CentralPanel::default_margins().show(ui, |ui| {
             let rect = ui.scope(|ui| {
                 let locked = busy || self.pending.is_some();
-                ui.add_enabled_ui(!locked, |ui| {
+                let bottom_top = ui.add_enabled_ui(!locked, |ui| {
                     egui::ComboBox::from_label("Output")
                         .selected_text(self.outputs.get(self.selected).map_or("none", |o| &o.name))
                         .show_index(ui, &mut self.selected, self.outputs.len(), |i| &self.outputs[i].name);
 
                     ui.separator();
-                    ui.spacing_mut().slider_width = 300.0;
                     let s = &mut self.settings;
-                    ui.add(egui::Slider::new(&mut s.brightness, icc::BRIGHTNESS_RANGE).text("Brightness").fixed_decimals(2).step_by(0.01));
-                    ui.add(egui::Slider::new(&mut s.gamma, icc::GAMMA_RANGE).text("Gamma").fixed_decimals(2).step_by(0.01));
-                    ui.add(egui::Slider::new(&mut s.contrast, icc::CONTRAST_RANGE).text("Contrast").fixed_decimals(2).step_by(0.01));
+                    ui.horizontal(|ui| {
+                        ui.add_space(((ui.available_width() - self.tabs_width) / 2.0).max(0.0));
+                        self.tabs_width = ui
+                            .horizontal(|ui| {
+                                ui.selectable_value(&mut s.tab, Tab::Sliders, "Brightness / Gamma / Contrast");
+                                ui.selectable_value(&mut s.tab, Tab::Levels, "Black / White point");
+                                ui.selectable_value(&mut s.tab, Tab::Draw, "Draw");
+                            })
+                            .response
+                            .rect
+                            .width();
+                    });
+                    // Until the startup fit settles, use minimum sizes: filling the window
+                    // while measuring it feeds any layout error back into the size, growing it forever.
+                    let grow = self.fitted;
+                    let slider_width = if grow { (ui.available_width() - self.slider_extra).max(300.0) } else { 300.0 };
+                    ui.spacing_mut().slider_width = slider_width;
+                    // While sizing the window at startup, reserve the tallest tab's height
+                    // (three slider rows); afterwards the curve takes whatever the sliders leave.
+                    let rows = 3.0 * ui.spacing().interact_size.y + 2.0 * ui.spacing().item_spacing.y;
+                    let sliders = ui.vertical(|ui| {
+                        if !grow {
+                            ui.set_min_height(rows);
+                        }
+                        match s.tab {
+                        Tab::Sliders => {
+                            let sl = &mut s.sliders;
+                            ui.add(egui::Slider::new(&mut sl.brightness, icc::BRIGHTNESS_RANGE).text("Brightness").fixed_decimals(2).step_by(0.01));
+                            ui.add(egui::Slider::new(&mut sl.gamma, icc::GAMMA_RANGE).text("Gamma").fixed_decimals(2).step_by(0.01));
+                            ui.add(egui::Slider::new(&mut sl.contrast, icc::CONTRAST_RANGE).text("Contrast").fixed_decimals(2).step_by(0.01));
+                            s.curve = icc::sliders_curve(sl);
+                        }
+                        Tab::Levels => {
+                            let l = &mut s.levels;
+                            ui.add(egui::Slider::new(&mut l.black, 0.0..=l.white - 0.01).text("Black point").fixed_decimals(2).step_by(0.01));
+                            ui.add(egui::Slider::new(&mut l.white, l.black + 0.01..=1.0).text("White point").fixed_decimals(2).step_by(0.01));
+                            s.curve = icc::levels_curve(l);
+                        }
+                        Tab::Draw => {}
+                        }
+                    });
+                    if s.tab != Tab::Draw {
+                        self.slider_extra = sliders.response.rect.width() - slider_width;
+                    }
+
+                    // The curve fills the space above the bottom rows, square, and sits right on top of them.
+                    let gap = ui.spacing().item_spacing.y;
+                    let free = egui::vec2(ui.available_width(), ui.available_height() - gap - self.bottom_height);
+                    let size = if grow { free.min_elem().max(300.0) } else { 300.0 };
+                    if grow {
+                        ui.add_space((free.y - size).max(0.0));
+                    }
+
+                    let (response, painter) = ui.vertical_centered(|ui| ui.allocate_painter(egui::vec2(size, size), egui::Sense::drag())).inner;
+                    let rect = response.rect;
+                    let to_screen = |x: f32, y: f32| egui::pos2(rect.left() + x * rect.width(), rect.bottom() - y * rect.height());
+                    painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+                    painter.line_segment([to_screen(0.0, 0.0), to_screen(1.0, 1.0)], ui.visuals().widgets.noninteractive.bg_stroke);
+                    let line = (0..=128).map(|i| i as f32 / 128.0).map(|x| to_screen(x, icc::eval(&s.curve, x))).collect();
+                    painter.add(egui::Shape::line(line, ui.visuals().widgets.active.fg_stroke));
+                    if s.tab == Tab::Draw
+                        && let Some(pos) = response.interact_pointer_pos()
+                    {
+                        let curve = &mut s.curve;
+                        let n = (icc::LEVELS - 1) as f32;
+                        let i = (((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0) * n).round() as usize;
+                        let y = ((rect.bottom() - pos.y) / rect.height()).clamp(0.0, 1.0);
+                        let (pi, py) = self.last_draw.unwrap_or((i, y));
+                        for j in pi.min(i)..=pi.max(i) {
+                            let t = if i == pi { 1.0 } else { (j as f32 - pi as f32) / (i as f32 - pi as f32) };
+                            curve[j] = py + (y - py) * t;
+                        }
+                        self.last_draw = Some((i, y));
+                    } else {
+                        self.last_draw = None;
+                    }
+                    let bottom_top = ui.cursor().top();
                     ui.horizontal(|ui| {
                         if ui.button("Apply").clicked() {
                             self.apply();
@@ -160,32 +246,39 @@ impl eframe::App for App {
 
                     ui.separator();
                     ui.horizontal(|ui| {
+                        let left = ui.cursor().left();
+                        let row_width = ui.available_width();
                         egui::ComboBox::from_id_salt("profile")
                             .selected_text("Load profile")
                             .show_ui(ui, |ui| {
                                 for (name, settings) in &self.profiles {
                                     if ui.selectable_label(*name == self.profile_name, name).clicked() {
                                         self.profile_name = name.clone();
-                                        self.settings = *settings;
+                                        self.settings = settings.clone();
                                     }
                                 }
                             });
-                        ui.add(egui::TextEdit::singleline(&mut self.profile_name).hint_text("Profile name").desired_width(140.0));
+                        let name_width = if grow { (row_width - self.profile_extra).max(140.0) } else { 140.0 };
+                        let name = ui.add(egui::TextEdit::singleline(&mut self.profile_name).hint_text("Profile name").desired_width(name_width));
                         let named = !self.profile_name.trim().is_empty();
                         if ui.add_enabled(named, egui::Button::new("Save")).clicked() {
-                            self.profiles.insert(self.profile_name.trim().to_owned(), self.settings);
+                            self.profiles.insert(self.profile_name.trim().to_owned(), self.settings.clone());
                             self.status = profiles::save(&self.profiles).err().map(|e| format!("{e:#}")).unwrap_or_default();
                         }
-                        if ui.add_enabled(self.profiles.contains_key(&self.profile_name), egui::Button::new("Delete")).clicked() {
+                        let delete = ui.add_enabled(self.profiles.contains_key(&self.profile_name), egui::Button::new("Delete"));
+                        if delete.clicked() {
                             self.profiles.remove(&self.profile_name);
                             self.status = profiles::save(&self.profiles).err().map(|e| format!("{e:#}")).unwrap_or_default();
                         }
+                        self.profile_extra = delete.rect.right() - left - name.rect.width();
                     });
+                    bottom_top
                 });
 
                 // Laid out even when empty so the startup size leaves room for it.
                 ui.separator();
                 ui.label(&self.status);
+                self.bottom_height = ui.min_rect().bottom() - bottom_top.inner;
             })
             .response
             .rect;
@@ -200,6 +293,8 @@ impl eframe::App for App {
             let size = content_size.inner;
             if (ui.ctx().viewport_rect().size() - size).length() < 1.0 {
                 self.fitted = true;
+                // The user may grow the window but not shrink it below what the UI needs.
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
             } else {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
                 ui.ctx().request_repaint_after(Duration::from_millis(16));
@@ -238,7 +333,7 @@ impl eframe::App for App {
             });
             match keep {
                 Some(true) => {
-                    self.applied = self.settings;
+                    self.applied = self.settings.clone();
                     self.pending = None;
                     self.status = "Settings kept.".into();
                 }
